@@ -1,0 +1,91 @@
+name: Build MiniOS and embedded ISO downloader
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    name: Build and verify MiniOS ISO
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc-multilib binutils xorriso mtools \
+            grub-common grub-pc-bin grub-efi-amd64-bin
+
+      - name: Compile and build hybrid ISO
+        run: |
+          make clean
+          make
+          test -s minios.iso
+          file minios.iso
+          grub-file --is-x86-multiboot2 build/minios.elf
+          xorriso -indev minios.iso -report_el_torito plain 2>&1 | tee el-torito.txt
+          grep -Eiq 'BIOS|i386-pc' el-torito.txt
+          grep -Eiq 'UEFI|efi' el-torito.txt
+
+      - name: Upload direct ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: minios-iso
+          path: minios.iso
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create one-file HTML with ISO embedded
+        run: |
+          mkdir -p site-build
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64
+          payload = base64.b64encode(Path("minios.iso").read_bytes()).decode("ascii")
+          page = Path("site/index.template.html").read_text(encoding="utf-8")
+          marker = "__MINIOS_ISO_BASE64__"
+          assert marker in page
+          Path("site-build/index.html").write_text(page.replace(marker, payload), encoding="utf-8")
+          print("Embedded ISO bytes:", len(payload))
+          PY
+          cp minios.iso site-build/minios.iso
+
+      - name: Upload website bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: minios-downloader-site
+          path: site-build/
+          if-no-files-found: error
+          retention-days: 30
+
+  deploy:
+    name: Publish downloader page
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download website bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: minios-downloader-site
+          path: site-build
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site-build
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
